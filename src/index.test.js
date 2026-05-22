@@ -25,6 +25,18 @@ describe('add', () => {
   test('throws TypeError if second argument is not a number', () => {
     expect(() => add(1, null)).toThrow(TypeError);
   });
+
+  test('adds zeros', () => {
+    expect(add(0, 0)).toBe(0);
+  });
+
+  test('throws TypeError if argument is undefined', () => {
+    expect(() => add(undefined, 1)).toThrow(TypeError);
+  });
+
+  test('returns NaN when adding NaN (NaN passes typeof check)', () => {
+    expect(add(NaN, 1)).toBeNaN();
+  });
 });
 
 describe('reverseString', () => {
@@ -47,6 +59,14 @@ describe('reverseString', () => {
   test('throws TypeError if argument is not a string', () => {
     expect(() => reverseString(123)).toThrow(TypeError);
     expect(() => reverseString(123)).toThrow('Argument must be a string');
+  });
+
+  test('reverses a numeric string', () => {
+    expect(reverseString('12345')).toBe('54321');
+  });
+
+  test('reverses a string with special characters', () => {
+    expect(reverseString('a!b@c')).toBe('c@b!a');
   });
 });
 
@@ -78,5 +98,17 @@ describe('isPalindrome', () => {
   test('throws TypeError if argument is not a string', () => {
     expect(() => isPalindrome(42)).toThrow(TypeError);
     expect(() => isPalindrome(42)).toThrow('Argument must be a string');
+  });
+
+  test('returns true for a numeric palindrome string', () => {
+    expect(isPalindrome('12321')).toBe(true);
+  });
+
+  test('returns true for string of only non-alphanumeric characters', () => {
+    expect(isPalindrome('...')).toBe(true);
+  });
+
+  test('returns false for two-character non-palindrome', () => {
+    expect(isPalindrome('ab')).toBe(false);
   });
 });
