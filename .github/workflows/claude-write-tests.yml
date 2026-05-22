@@ -1,0 +1,181 @@
+name: Claude Write Unit Tests
+
+# ============================================================
+# 觸發方式（任一條件成立都會跑）：
+#   1. 在 PR 留言寫 "/write-tests"
+#   2. 在 PR 的 code review 留言寫 "/write-tests"
+#   3. 在 Actions 頁面手動 Run workflow
+#
+# 防迴圈保護：
+#   - claude[bot] 或 github-actions[bot] 的留言/動作不會觸發
+#   - 最新 commit 已經是 claude bot 的話，跑到 step 4 會自動 skip
+# ============================================================
+# ============================================================
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to write tests for"
+        required: true
+        type: number
+
+jobs:
+  write-tests:
+    # ----------------------------------------------------------
+    # 守門條件：擋掉不該觸發的情況
+    # ----------------------------------------------------------
+    if: |
+      github.actor != 'claude[bot]' &&
+      github.actor != 'github-actions[bot]' &&
+      contains(github.actor, 'claude') == false &&
+      (
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null &&
+          contains(github.event.comment.body, '/write-tests')
+        ) ||
+        (
+          github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '/write-tests')
+        ) ||
+        github.event_name == 'workflow_dispatch'
+      )
+
+    runs-on: ubuntu-latest
+
+    # ----------------------------------------------------------
+    # 權限：給 Claude 必要的 GitHub 操作權限
+    # ----------------------------------------------------------
+    permissions:
+      contents: write # push commit 用
+      pull-requests: write # 留 PR comment 用
+      issues: write # 在 PR 對話區留言用（PR comment 走 issues API）
+      id-token: write # OIDC
+
+    steps:
+      # ----------------------------------------------------------
+      # Step 1: 取出 PR 編號（不同 event 拿法不一樣）
+      # ----------------------------------------------------------
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          case "${{ github.event_name }}" in
+            issue_comment)
+              echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+              ;;
+            pull_request_review_comment)
+              echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+              ;;
+            workflow_dispatch)
+              echo "number=${{ inputs.pr_number }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      # ----------------------------------------------------------
+      # Step 2: 抓 PR 詳細資訊（branch 名稱、SHA）
+      # ----------------------------------------------------------
+      - name: Fetch PR metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }})
+          echo "head_ref=$(echo "$PR_DATA" | jq -r .head.ref)" >> $GITHUB_OUTPUT
+          echo "head_sha=$(echo "$PR_DATA" | jq -r .head.sha)" >> $GITHUB_OUTPUT
+          echo "base_ref=$(echo "$PR_DATA" | jq -r .base.ref)" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------
+      # Step 3: Checkout PR 的 branch（不是 main）
+      # ----------------------------------------------------------
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.head_ref }}
+          fetch-depth: 0 # 需要完整 history 才能跟 base branch 比 diff
+
+      # ----------------------------------------------------------
+      # Step 4: 守門條件 — 最新 commit 已經是 claude bot 的就跳過
+      # ----------------------------------------------------------
+      - name: Check if already processed
+        id: guard
+        run: |
+          LAST_AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae')
+          LAST_AUTHOR_NAME=$(git log -1 --pretty=format:'%an')
+          echo "Last commit by: $LAST_AUTHOR_NAME <$LAST_AUTHOR_EMAIL>"
+
+          if echo "$LAST_AUTHOR_EMAIL $LAST_AUTHOR_NAME" | grep -qi 'claude'; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "::notice::Latest commit is from claude bot, skipping"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post skip notice and exit
+        if: steps.guard.outputs.skip == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ steps.pr.outputs.number }} \
+            --body "⏭️ Skipping unit test generation: latest commit is already from claude bot."
+          exit 0
+
+      # ----------------------------------------------------------
+      # Step 5: 跑 Claude Code,讓它寫測試並 push commit
+      # ----------------------------------------------------------
+      - name: Run Claude to write unit tests
+        if: steps.guard.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are working on PR #${{ steps.pr.outputs.number }} on branch `${{ steps.meta.outputs.head_ref }}`.
+            The base branch is `${{ steps.meta.outputs.base_ref }}`.
+
+            ## Your task
+            Write unit tests for the code changes introduced in this PR, then commit
+            and push them to the same branch.
+
+            ## Scope rules
+            - ONLY write tests for functions/classes that were ADDED or MODIFIED in
+              this PR's diff. Run `git diff origin/${{ steps.meta.outputs.base_ref }}...HEAD`
+              to see what changed.
+            - Do NOT modify production code.
+            - Do NOT touch existing tests unless they cover a function that was
+              modified in this PR and now needs updating.
+
+            ## Test conventions
+            - Detect the test framework from the repo (pytest, jest, vitest, go test, etc.)
+              by looking at config files (pyproject.toml, package.json, go.mod).
+            - Follow the existing test file structure and naming.
+            - For each modified function, cover at minimum:
+              * Happy path
+              * One edge case (empty input, boundary, etc.)
+              * Error handling branch if the function can fail
+
+            ## After writing tests
+            1. Run the test suite locally to confirm everything passes.
+            2. If tests fail, fix them before committing.
+            3. Commit with message format: `test: add unit tests for <function/module>`
+            4. Push to `${{ steps.meta.outputs.head_ref }}`.
+            5. Post a comment on PR #${{ steps.pr.outputs.number }} listing which
+               test files were added/modified and what coverage was added.
+
+            ## Important
+            - If you cannot determine the test framework, post a comment asking for
+              clarification instead of guessing.
+            - If the diff contains no testable code (only docs, config, formatting),
+              post a comment saying so and exit without committing.
+            - When posting any comment on the PR, do NOT include the literal string
+              "/write-tests" anywhere in your message body. Even when referring to
+              the trigger command, describe it without the slash (e.g. "the
+              write-tests command" or "this workflow"). This prevents accidentally
+              triggering another workflow run.
+            - Same rule for commit messages: do NOT put "/write-tests" in any
+              commit message.
